@@ -44,14 +44,19 @@ export class BindGroupSystem implements System
 
     public getBindGroup(bindGroup: BindGroup, program: GpuProgram, groupIndex: number): GPUBindGroup
     {
-        bindGroup._updateKey();
+        // The cache key must include both the resources AND the program layout,
+        // because a GPUBindGroup must exactly match its GPUBindGroupLayout.
+        // Two programs with different layouts cannot share a GPUBindGroup,
+        // even if they use the same resources.
+        // Bit shift combines layoutKey and groupIndex into single number (groupIndex < 16)
+        const key = `${bindGroup._key}:${(program._layoutKey << 4) | groupIndex}`;
 
-        const gpuBindGroup = this._hash[bindGroup._key] || this._createBindGroup(bindGroup, program, groupIndex);
+        const gpuBindGroup = this._hash[key] || this._createBindGroup(key, bindGroup, program, groupIndex);
 
         return gpuBindGroup;
     }
 
-    private _createBindGroup(group: BindGroup, program: GpuProgram, groupIndex: number): GPUBindGroup
+    private _createBindGroup(key: string, group: BindGroup, program: GpuProgram, groupIndex: number): GPUBindGroup
     {
         const device = this._gpu.device;
         const groupLayout = program.layout[groupIndex];
@@ -60,7 +65,7 @@ export class BindGroupSystem implements System
 
         for (const j in groupLayout)
         {
-            const resource: BindResource = group.resources[j] ?? group.resources[groupLayout[j]];
+            const resource: BindResource = group.resources[j as unknown as number] ?? group.resources[groupLayout[j]];
             let gpuResource: GPUSampler | GPUTextureView | GPUExternalTexture | GPUBufferBinding;
             // TODO make this dynamic..
 
@@ -95,7 +100,7 @@ export class BindGroupSystem implements System
                 gpuResource = {
                     buffer: renderer.buffer.getGPUBuffer(bufferResource.buffer),
                     offset: bufferResource.offset,
-                    size: bufferResource.size,
+                    size: bufferResource.size ?? bufferResource.buffer.descriptor.size,
                 };
             }
             else if (resource._resourceType === 'textureSampler')
@@ -124,7 +129,7 @@ export class BindGroupSystem implements System
             entries,
         });
 
-        this._hash[group._key] = gpuBindGroup;
+        this._hash[key] = gpuBindGroup;
 
         return gpuBindGroup;
     }

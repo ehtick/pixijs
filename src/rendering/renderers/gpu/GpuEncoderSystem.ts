@@ -1,4 +1,5 @@
 import { ExtensionType } from '../../../extensions/Extensions';
+import { type ShaderOverrides } from '../shared/shader/ShaderOverrides';
 
 import type { Rectangle } from '../../../maths/shapes/Rectangle';
 import type { Buffer } from '../shared/buffer/Buffer';
@@ -37,6 +38,7 @@ export class GpuEncoderSystem implements System
 
     private _gpu: GPU;
     private _boundBindGroup: Record<number, BindGroup> = Object.create(null);
+    private _boundBindGroupKey: Record<number, string> = Object.create(null);
     private _boundVertexBuffer: Record<number, Buffer> = Object.create(null);
     private _boundIndexBuffer: Buffer;
     private _boundPipeline: GPURenderPipeline;
@@ -89,9 +91,16 @@ export class GpuEncoderSystem implements System
         program: GpuProgram,
         state: any,
         topology?: Topology,
+        overrides?: ShaderOverrides,
     ): void
     {
-        const pipeline = this._renderer.pipeline.getPipeline(geometry, program, state, topology);
+        const pipeline = this._renderer.pipeline.getPipeline(
+            geometry,
+            program,
+            state,
+            topology,
+            overrides,
+        );
 
         this.setPipeline(pipeline);
     }
@@ -127,20 +136,20 @@ export class GpuEncoderSystem implements System
     public resetBindGroup(index: number)
     {
         this._boundBindGroup[index] = null;
+        this._boundBindGroupKey[index] = null;
     }
 
     public setBindGroup(index: number, bindGroup: BindGroup, program: GpuProgram)
     {
-        if (this._boundBindGroup[index] === bindGroup) return;
+        if (this._boundBindGroupKey[index] === bindGroup._key) return;
+
         this._boundBindGroup[index] = bindGroup;
+        this._boundBindGroupKey[index] = bindGroup._key;
 
         bindGroup._touch(this._renderer.gc.now, this._renderer.tick);
 
-        // TODO getting the bind group works as it looks at th e assets and generates a key
-        // should this just be hidden behind a dirty flag?
         const gpuBindGroup = this._renderer.bindGroup.getBindGroup(bindGroup, program, index);
 
-        // mark each item as having been used..
         this.renderPassEncoder.setBindGroup(index, gpuBindGroup);
     }
 
@@ -203,11 +212,12 @@ export class GpuEncoderSystem implements System
         start?: number;
         instanceCount?: number;
         skipSync?: boolean;
+        firstInstance?: number;
     })
     {
-        const { geometry, shader, state, topology, size, start, instanceCount, skipSync } = options;
+        const { geometry, shader, state, topology, size, start, instanceCount, skipSync, firstInstance } = options;
 
-        this.setPipelineFromGeometryProgramAndState(geometry, shader.gpuProgram, state, topology);
+        this.setPipelineFromGeometryProgramAndState(geometry, shader.gpuProgram, state, topology, shader._overrides);
         this.setGeometry(geometry, shader.gpuProgram);
         this._setShaderBindGroups(shader, skipSync);
 
@@ -216,12 +226,20 @@ export class GpuEncoderSystem implements System
             this.renderPassEncoder.drawIndexed(
                 size || geometry.indexBuffer.data.length,
                 instanceCount ?? geometry.instanceCount,
-                start || 0
+                start || 0,
+                0,
+                firstInstance || 0
+
             );
         }
         else
         {
-            this.renderPassEncoder.draw(size || geometry.getSize(), instanceCount ?? geometry.instanceCount, start || 0);
+            this.renderPassEncoder.draw(
+                size || geometry.getSize(),
+                instanceCount ?? geometry.instanceCount,
+                start || 0,
+                firstInstance || 0
+            );
         }
     }
 
@@ -293,6 +311,7 @@ export class GpuEncoderSystem implements System
         for (let i = 0; i < 16; i++)
         {
             this._boundBindGroup[i] = null;
+            this._boundBindGroupKey[i] = null;
             this._boundVertexBuffer[i] = null;
         }
 
@@ -305,6 +324,7 @@ export class GpuEncoderSystem implements System
         (this._renderer as null) = null;
         this._gpu = null;
         this._boundBindGroup = null;
+        this._boundBindGroupKey = null;
         this._boundVertexBuffer = null;
         this._boundIndexBuffer = null;
         this._boundPipeline = null;
