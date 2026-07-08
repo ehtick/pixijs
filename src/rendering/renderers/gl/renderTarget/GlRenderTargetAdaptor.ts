@@ -25,6 +25,13 @@ export class GlRenderTargetAdaptor implements RenderTargetAdaptor<GlRenderTarget
     private _viewPortCache: Rectangle = new Rectangle();
     /** Pre-computed draw buffers arrays for MRT, indexed by color attachment count */
     private _drawBuffersCache: number[][];
+    /**
+     * The framebuffer currently bound to `gl.FRAMEBUFFER`, used to skip a redundant `bindFramebuffer`
+     * when re-binding the same target. `undefined` means "unknown" (force a real bind). All framebuffer
+     * binding must go through {@link bindFramebuffer} to keep this coherent; {@link resetState} marks
+     * it unknown when external GL code may have changed the binding.
+     */
+    private _boundFramebuffer: WebGLFramebuffer | null | undefined = undefined;
 
     public init(renderer: WebGLRenderer, renderTargetSystem: RenderTargetSystem<GlRenderTarget>): void
     {
@@ -38,6 +45,7 @@ export class GlRenderTargetAdaptor implements RenderTargetAdaptor<GlRenderTarget
     {
         this._clearColorCache = [0, 0, 0, 0];
         this._viewPortCache = new Rectangle();
+        this._boundFramebuffer = undefined;
 
         // Pre-compute draw buffers arrays for all possible MRT configurations
         const gl = this._renderer.gl;
@@ -67,6 +75,7 @@ export class GlRenderTargetAdaptor implements RenderTargetAdaptor<GlRenderTarget
         this.finishRenderPass(sourceRenderSurfaceTexture);
 
         gl.bindFramebuffer(gl.FRAMEBUFFER, glRenderTarget.resolveTargetFramebuffer);
+        this._boundFramebuffer = glRenderTarget.resolveTargetFramebuffer;
 
         renderer.texture.bind(destinationTexture, 0);
 
@@ -115,31 +124,27 @@ export class GlRenderTargetAdaptor implements RenderTargetAdaptor<GlRenderTarget
 
         // do the work..
 
-        let viewPortY = viewport.y;
-
-        if (renderTarget.isRoot)
+        renderTarget.colorAttachments.forEach((attachment) =>
         {
-            viewPortY = renderTarget.pixelHeight - viewport.height - viewport.y;
-        }
-
-        renderTarget.colorTextures.forEach((texture) =>
-        {
-            this._renderer.texture.unbind(texture);
+            this._renderer.texture.unbind(attachment.texture);
         });
 
         const gl = this._renderer.gl;
 
-        gl.bindFramebuffer(gl.FRAMEBUFFER, gpuRenderTarget.framebuffer);
+        // Skip a redundant glBindFramebuffer when this FBO is already bound (idempotent bind).
+        // The attachment (mip/layer) and viewport caches below still re-run their own "math".
+        this.bindFramebuffer(gpuRenderTarget.framebuffer);
 
         if (
             !renderTarget.isRoot
-            && renderTarget.colorTextures.length > 0
+            && renderTarget.colorAttachments.length > 0
             && (gpuRenderTarget._attachedMipLevel !== mipLevel
                 || gpuRenderTarget._attachedLayer !== layer)
         )
         {
-            renderTarget.colorTextures.forEach((colorTexture, i) =>
+            renderTarget.colorAttachments.forEach((attachment, i) =>
             {
+                const colorTexture = attachment.texture;
                 const glSource = this._renderer.texture.getGlSource(colorTexture);
 
                 if (glSource.target === gl.TEXTURE_2D)
@@ -197,20 +202,32 @@ export class GlRenderTargetAdaptor implements RenderTargetAdaptor<GlRenderTarget
             gpuRenderTarget._attachedLayer = layer;
         }
 
-        if (renderTarget.depthStencilTexture)
+        // the root target renders to the canvas, whose context owns its depth/stencil buffers
+        if (gpuRenderTarget.framebuffer)
         {
-            this._attachDepthStencilTexture(renderTarget, mipLevel, layer);
-        }
-        // if the stencil buffer has been requested, we need to create a stencil buffer
-        else if (!gpuRenderTarget.depthStencilRenderBuffer && (renderTarget.stencil || renderTarget.depth))
-        {
-            this._initStencil(gpuRenderTarget);
+            if (renderTarget.depthStencilAttachment)
+            {
+                this._attachDepthStencilTexture(renderTarget, mipLevel, layer);
+            }
+            // depth/stencil requested without an explicit texture — a renderbuffer is cheaper
+            // and (unlike a texture) can be multisampled to match an MSAA color attachment
+            else if (!gpuRenderTarget.depthStencilRenderBuffer && (renderTarget.stencil || renderTarget.depth))
+            {
+                this._initStencil(gpuRenderTarget);
+            }
         }
 
         // Set draw buffers for multiple render targets (MRT)
-        if (renderTarget.colorTextures.length > 1)
+        if (renderTarget.colorAttachments.length > 1)
         {
             this._setDrawBuffers(renderTarget, gl);
+        }
+
+        let viewPortY = viewport.y;
+
+        if (renderTarget.isRoot)
+        {
+            viewPortY = renderTarget.pixelHeight - viewport.height - viewport.y;
         }
 
         const viewPortCache = this._viewPortCache;
@@ -243,7 +260,7 @@ export class GlRenderTargetAdaptor implements RenderTargetAdaptor<GlRenderTarget
         const glRenderTarget = renderTargetSystem.getGpuRenderTarget(renderTarget);
 
         // Depth-only targets have no color buffer to resolve
-        if (!glRenderTarget.msaa || renderTarget.colorTextures.length === 0) return;
+        if (!glRenderTarget.msaa || renderTarget.colorAttachments.length === 0) return;
 
         const gl = this._renderer.gl;
 
@@ -257,6 +274,8 @@ export class GlRenderTargetAdaptor implements RenderTargetAdaptor<GlRenderTarget
         );
 
         gl.bindFramebuffer(gl.FRAMEBUFFER, glRenderTarget.framebuffer);
+        // we explicitly drove FRAMEBUFFER (both read+draw) back to the multisample framebuffer
+        this._boundFramebuffer = glRenderTarget.framebuffer;
     }
 
     public initGpuRenderTarget(renderTarget: RenderTarget): GlRenderTarget
@@ -284,7 +303,7 @@ export class GlRenderTargetAdaptor implements RenderTargetAdaptor<GlRenderTarget
         glRenderTarget.width = renderTarget.pixelWidth;
         glRenderTarget.height = renderTarget.pixelHeight;
 
-        if (renderTarget.colorTextures.length === 0)
+        if (renderTarget.colorAttachments.length === 0)
         {
             this._initDepth(renderTarget, glRenderTarget);
         }
@@ -293,12 +312,14 @@ export class GlRenderTargetAdaptor implements RenderTargetAdaptor<GlRenderTarget
             this._initColor(renderTarget, glRenderTarget);
         }
 
-        if (renderTarget.depthStencilTexture)
+        if (renderTarget.depthStencilAttachment)
         {
             this._attachDepthStencilTexture(renderTarget, 0, 0);
         }
 
         gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        // init drove the binding through several raw framebuffers and ended on the default one
+        this._boundFramebuffer = null;
 
         return glRenderTarget;
     }
@@ -358,7 +379,7 @@ export class GlRenderTargetAdaptor implements RenderTargetAdaptor<GlRenderTarget
         }
 
         // Strip the COLOR bit for depth-only targets – there is no color buffer to clear.
-        if (renderTarget.colorTextures.length === 0)
+        if (renderTarget.colorAttachments.length === 0)
         {
             clear &= ~CLEAR.COLOR;
 
@@ -366,6 +387,10 @@ export class GlRenderTargetAdaptor implements RenderTargetAdaptor<GlRenderTarget
         }
 
         const gl = this._renderer.gl;
+
+        // gl.clear's depth write is masked by gl.depthMask, which 2D rendering
+        // (State.for2d) leaves disabled — force it on for the clear, then restore
+        const forceDepthMask = !!(clear & CLEAR.DEPTH) && !this._renderer.state.depthMaskEnabled;
 
         if (clear & CLEAR.COLOR)
         {
@@ -388,7 +413,11 @@ export class GlRenderTargetAdaptor implements RenderTargetAdaptor<GlRenderTarget
             }
         }
 
+        if (forceDepthMask) gl.depthMask(true);
+
         gl.clear(clear);
+
+        if (forceDepthMask) gl.depthMask(false);
     }
 
     public resizeGpuRenderTarget(renderTarget: RenderTarget)
@@ -400,15 +429,18 @@ export class GlRenderTargetAdaptor implements RenderTargetAdaptor<GlRenderTarget
         glRenderTarget.width = renderTarget.pixelWidth;
         glRenderTarget.height = renderTarget.pixelHeight;
 
-        if (renderTarget.colorTextures.length > 0)
+        if (renderTarget.colorAttachments.length > 0)
         {
             this._resizeColor(renderTarget, glRenderTarget);
         }
 
-        if (renderTarget.stencil || renderTarget.depth)
+        if (glRenderTarget.depthStencilRenderBuffer)
         {
             this._resizeStencil(glRenderTarget);
         }
+
+        // _resizeColor (MSAA) rebinds framebuffers; force the next startRenderPass to bind explicitly
+        this._boundFramebuffer = undefined;
     }
 
     private _initColor(renderTarget: RenderTarget, glRenderTarget: GlRenderTarget)
@@ -424,11 +456,11 @@ export class GlRenderTargetAdaptor implements RenderTargetAdaptor<GlRenderTarget
         // set up the texture..
         gl.bindFramebuffer(gl.FRAMEBUFFER, resolveTargetFramebuffer);
 
-        const colorTextures = renderTarget.colorTextures;
+        const colorAttachments = renderTarget.colorAttachments;
 
-        colorTextures.forEach((colorTexture, i) =>
+        colorAttachments.forEach((colorAttachment, i) =>
         {
-            const source = colorTexture.source;
+            const source = colorAttachment.texture;
 
             if (source.antialias)
             {
@@ -498,7 +530,7 @@ export class GlRenderTargetAdaptor implements RenderTargetAdaptor<GlRenderTarget
 
             gl.bindFramebuffer(gl.FRAMEBUFFER, viewFramebuffer);
 
-            renderTarget.colorTextures.forEach((_, i) =>
+            renderTarget.colorAttachments.forEach((_, i) =>
             {
                 const msaaRenderBuffer = gl.createRenderbuffer();
 
@@ -536,19 +568,19 @@ export class GlRenderTargetAdaptor implements RenderTargetAdaptor<GlRenderTarget
 
     private _resizeColor(renderTarget: RenderTarget, glRenderTarget: GlRenderTarget)
     {
-        const source = renderTarget.colorTexture.source;
+        const source = renderTarget.colorAttachments[0].texture;
 
         // After a resize, attachments are implicitly at mip 0 again (and non-zero mip allocations may have changed).
         // Force a re-attach on next mip render.
         glRenderTarget._attachedMipLevel = 0;
         glRenderTarget._attachedLayer = 0;
 
-        renderTarget.colorTextures.forEach((colorTexture, i) =>
+        renderTarget.colorAttachments.forEach((colorAttachment, i) =>
         {
             // no need to resize the first texture..
             if (i === 0) return;
 
-            colorTexture.source.resize(source.width, source.height, source._resolution);
+            colorAttachment.texture.resize(source.width, source.height, source._resolution);
         });
 
         if (glRenderTarget.msaa)
@@ -560,9 +592,9 @@ export class GlRenderTargetAdaptor implements RenderTargetAdaptor<GlRenderTarget
 
             gl.bindFramebuffer(gl.FRAMEBUFFER, viewFramebuffer);
 
-            renderTarget.colorTextures.forEach((colorTexture, i) =>
+            renderTarget.colorAttachments.forEach((colorAttachment, i) =>
             {
-                const source = colorTexture.source;
+                const source = colorAttachment.texture;
 
                 renderer.texture.bindSource(source, 0);
                 const glSource = renderer.texture.getGlSource(source);
@@ -602,17 +634,26 @@ export class GlRenderTargetAdaptor implements RenderTargetAdaptor<GlRenderTarget
     {
         const renderer = this._renderer;
         const gl = renderer.gl;
-        const source = renderTarget.depthStencilTexture;
+        const source = renderTarget.depthStencilAttachment.texture;
 
         const glSource = renderer.texture.getGlSource(source);
         const glTexture = glSource.texture;
         const format = source.format;
 
-        let attachment: number = gl.DEPTH_ATTACHMENT;
+        // the attachment point must match the texture's aspects, or the framebuffer is incomplete
+        let attachment: number;
 
-        if (format === 'depth24plus-stencil8' || format === 'depth24plus' || format === 'stencil8')
+        if (format === 'depth24plus-stencil8' || format === 'depth32float-stencil8')
         {
             attachment = gl.DEPTH_STENCIL_ATTACHMENT;
+        }
+        else if (format === 'stencil8')
+        {
+            attachment = gl.STENCIL_ATTACHMENT;
+        }
+        else
+        {
+            attachment = gl.DEPTH_ATTACHMENT;
         }
 
         if (glSource.target === gl.TEXTURE_2D)
@@ -708,9 +749,9 @@ export class GlRenderTargetAdaptor implements RenderTargetAdaptor<GlRenderTarget
 
     public prerender(renderTarget: RenderTarget)
     {
-        if (renderTarget.colorTextures.length === 0) return;
+        if (renderTarget.colorAttachments.length === 0) return;
 
-        const resource = renderTarget.colorTexture.resource;
+        const resource = renderTarget.colorAttachments[0].texture.resource;
 
         if (this._renderer.context.multiView && CanvasSource.test(resource))
         {
@@ -720,12 +761,14 @@ export class GlRenderTargetAdaptor implements RenderTargetAdaptor<GlRenderTarget
 
     public postrender(renderTarget: RenderTarget)
     {
-        if (!this._renderer.context.multiView || renderTarget.colorTextures.length === 0) return;
+        if (!this._renderer.context.multiView || renderTarget.colorAttachments.length === 0) return;
 
-        if (CanvasSource.test(renderTarget.colorTexture.resource))
+        const colorTexture = renderTarget.colorAttachments[0].texture;
+
+        if (CanvasSource.test(colorTexture.resource))
         {
             const contextCanvas = this._renderer.context.canvas;
-            const canvasSource = renderTarget.colorTexture as unknown as CanvasSource;
+            const canvasSource = colorTexture as unknown as CanvasSource;
 
             canvasSource.context2D.drawImage(
                 contextCanvas as CanvasImageSource,
@@ -736,7 +779,7 @@ export class GlRenderTargetAdaptor implements RenderTargetAdaptor<GlRenderTarget
 
     private _setDrawBuffers(renderTarget: RenderTarget, gl: GlRenderingContext): void
     {
-        const count = renderTarget.colorTextures.length;
+        const count = renderTarget.colorAttachments.length;
         const bufferArray = this._drawBuffersCache[count];
 
         if (this._renderer.context.webGLVersion === 1)
@@ -757,5 +800,32 @@ export class GlRenderTargetAdaptor implements RenderTargetAdaptor<GlRenderTarget
             // WebGL2 has built in support
             gl.drawBuffers(bufferArray);
         }
+    }
+
+    /**
+     * Forget the GL-call caches (framebuffer binding, viewport, clear color) so the next pass
+     * re-applies them. Called via the renderer's `resetState` runner when external GL code may
+     * have changed state behind our back.
+     * @internal
+     */
+    public resetState(): void
+    {
+        this._boundFramebuffer = undefined;
+        this._viewPortCache = new Rectangle();
+        this._clearColorCache = [0, 0, 0, 0];
+    }
+
+    /**
+     * Binds a framebuffer to `gl.FRAMEBUFFER`, skipping the call when it is already bound.
+     * The single blessed way to bind a framebuffer — keeps {@link _boundFramebuffer} coherent.
+     * @param framebuffer - the framebuffer to bind
+     * @internal
+     */
+    public bindFramebuffer(framebuffer: WebGLFramebuffer | null): void
+    {
+        if (this._boundFramebuffer === framebuffer) return;
+
+        this._boundFramebuffer = framebuffer;
+        this._renderer.gl.bindFramebuffer(this._renderer.gl.FRAMEBUFFER, framebuffer);
     }
 }
